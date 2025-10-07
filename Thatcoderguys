@@ -1,0 +1,261 @@
+// PROJECT: simple-web-proxy (improved)
+// Files included below: package.json, server.js, public/index.html, .env.example, Dockerfile, README.md
+
+/* package.json */
+{
+  "name": "simple-web-proxy",
+  "version": "1.0.1",
+  "description": "Minimal educational web proxy (Express + Axios + Cheerio) with simple auth and rate limiting.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.5.0",
+    "cheerio": "^1.0.0-rc.12",
+    "express": "^4.18.2",
+    "morgan": "^1.10.0",
+    "helmet": "^7.0.0",
+    "rate-limit-flexible": "^2.3.0",
+    "basic-auth": "^2.0.1",
+    "dotenv": "^16.0.0"
+  }
+}
+
+/* .env.example */
+# Copy to .env and edit
+PORT=3000
+BASIC_USER=admin
+BASIC_PASS=changeme
+RATE_POINTS=30
+RATE_DURATION=60
+
+/* server.js */
+const express = require('express');
+const axios = require('axios');
+const cheerio = require('cheerio');
+const path = require('path');
+const morgan = require('morgan');
+const helmet = require('helmet');
+const basicAuth = require('basic-auth');
+const { RateLimiterMemory } = require('rate-limit-flexible');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Security middlewares
+app.use(helmet());
+app.use(morgan('tiny'));
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Simple basic auth (optional - enable by setting BASIC_USER/BASIC_PASS)
+const BASIC_USER = process.env.BASIC_USER;
+const BASIC_PASS = process.env.BASIC_PASS;
+function requireAuth(req, res, next) {
+  if (!BASIC_USER || !BASIC_PASS) return next(); // auth disabled if not set
+  const user = basicAuth(req);
+  if (!user || user.name !== BASIC_USER || user.pass !== BASIC_PASS) {
+    res.set('WWW-Authenticate', 'Basic realm="SimpleWebProxy"');
+    return res.status(401).send('Authentication required');
+  }
+  return next();
+}
+app.use(requireAuth);
+
+// Rate limiter
+const points = parseInt(process.env.RATE_POINTS || '30', 10);
+const duration = parseInt(process.env.RATE_DURATION || '60', 10);
+const limiter = new RateLimiterMemory({ points, duration });
+app.use((req, res, next) => {
+  const ip = req.ip || req.connection.remoteAddress;
+  limiter.consume(ip)
+    .then(() => next())
+    .catch(() => res.status(429).send('Too many requests - slow down'));
+});
+
+// Helpers
+function isAbsoluteUrl(url) {
+  return /^(?:[a-z]+:)?\/\//i.test(url);
+}
+
+app.get('/proxy', async (req, res) => {
+  const target = req.query.url;
+  if (!target) return res.status(400).send('Missing url parameter');
+  if (!/^https?:\/\//i.test(target)) return res.status(400).send('Only http(s) URLs are supported');
+
+  try {
+    const response = await axios.get(target, {
+      responseType: 'arraybuffer',
+      validateStatus: null,
+      headers: { 'User-Agent': 'SimpleWebProxy/1.0' }
+    });
+
+    const contentType = response.headers['content-type'] || '';
+    if (contentType.includes('text/html')) {
+      const html = response.data.toString('utf8');
+      const $ = cheerio.load(html, { decodeEntities: false });
+
+      // Rewrite anchors to route through proxy
+      $('a[href]').each((i, el) => {
+        const href = $(el).attr('href');
+        if (!href) return;
+        try {
+          const abs = new URL(href, target).toString();
+          $(el).attr('href', `/proxy?url=${encodeURIComponent(abs)}`);
+        } catch (e) { /* ignore invalid URLs */ }
+      });
+
+      // Rewrite static assets to /fetch
+      $('[src]').each((i, el) => {
+        const src = $(el).attr('src');
+        if (!src) return;
+        try {
+          const abs = new URL(src, target).toString();
+          $(el).attr('src', `/fetch?url=${encodeURIComponent(abs)}`);
+        } catch (e) {}
+      });
+      $('link[href]').each((i, el) => {
+        const href = $(el).attr('href');
+        if (!href) return;
+        try {
+          const abs = new URL(href, target).toString();
+          $(el).attr('href', `/fetch?url=${encodeURIComponent(abs)}`);
+        } catch (e) {}
+      });
+
+      // Forms: rewrite to GET via proxy (POSTs not proxied by default)
+      $('form[action]').each((i, el) => {
+        const action = $(el).attr('action') || '';
+        try {
+          const abs = new URL(action, target).toString();
+          $(el).attr('action', `/proxy?url=${encodeURIComponent(abs)}`);
+          $(el).attr('method', 'GET');
+        } catch (e) {}
+      });
+
+      // Small badge
+      $('body').prepend(`<div style="position:fixed;top:0;left:0;right:0;background:#111;color:#fff;padding:6px;z-index:9999;font-family:Arial;font-size:12px;opacity:0.95">Proxied via SimpleWebProxy — <a href="/" style="color:#aaf">Home</a></div><div style="height:36px"></div>`);
+
+      const out = $.html({ decodeEntities: false });
+      res.set('content-type', 'text/html; charset=utf-8');
+      return res.send(out);
+    }
+
+    // Non-HTML: pass through
+    res.set('content-type', contentType);
+    return res.send(Buffer.from(response.data));
+  } catch (err) {
+    console.error('Proxy error:', err.message);
+    return res.status(502).send('Bad gateway: error fetching target');
+  }
+});
+
+app.get('/fetch', async (req, res) => {
+  const target = req.query.url;
+  if (!target) return res.status(400).send('Missing url parameter');
+  if (!/^https?:\/\//i.test(target)) return res.status(400).send('Only http(s) URLs are supported');
+  try {
+    const response = await axios.get(target, { responseType: 'arraybuffer', validateStatus: null });
+    const contentType = response.headers['content-type'] || '';
+    res.set('content-type', contentType);
+    res.send(Buffer.from(response.data));
+  } catch (err) {
+    console.error('Fetch error:', err.message);
+    res.status(502).send('Bad gateway: error fetching asset');
+  }
+});
+
+app.listen(PORT, () => console.log(`SimpleWebProxy running on port ${PORT}`));
+
+/* public/index.html */
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Simple Web Proxy</title>
+    <style>
+      body{font-family:Inter,system-ui,Arial;margin:0;padding:24px;background:#f6f7fb}
+      .box{max-width:900px;margin:0 auto}
+      input[type=text]{width:78%;padding:10px;font-size:16px}
+      button{padding:10px 12px;font-size:16px}
+      .note{margin-top:12px;color:#555}
+    </style>
+  </head>
+  <body>
+    <div class="box">
+      <h1>Simple Web Proxy</h1>
+      <p>Type a full URL (including <code>https://</code>) and press Go.</p>
+      <form id="proxyForm" action="/proxy" method="get" target="_blank">
+        <input id="url" name="url" type="text" placeholder="https://example.com" />
+        <button type="submit">Go</button>
+      </form>
+      <p class="note">This is a minimal educational proxy. It won't perfectly handle complex sites (SPAs, websockets, cross-origin restrictions).
+      Don't use it to break rules or commit wrongdoing. Operator can see proxied traffic.</p>
+    </div>
+  </body>
+</html>
+
+/* Dockerfile */
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+EXPOSE 3000
+CMD ["node","server.js"]
+
+/* README.md */
+# Simple Web Proxy
+
+Minimal educational web proxy (Node/Express). Use for learning and testing. DO NOT use to bypass school/work rules or commit illegal acts.
+
+## Files
+- `server.js` - main server
+- `public/index.html` - simple UI
+- `package.json` - deps
+- `.env.example` - env vars
+- `Dockerfile` - optional container
+
+## Local run
+1. Copy `.env.example` to `.env` and edit.
+2. `npm install`
+3. `node server.js`
+4. Open `http://localhost:3000`
+
+## Deploy to Render.com (recommended)
+1. Create a GitHub repo with these files and push.
+2. Sign up at https://render.com and connect GitHub.
+3. Create a new Web Service → select the repo.
+   - Build command: `npm install`
+   - Start command: `node server.js`
+4. Deploy and get `https://your-service.onrender.com`.
+
+## Quick demo on Glitch
+1. Create a new project at https://glitch.com
+2. Import from GitHub or paste files.
+3. Glitch runs the app and gives a `.glitch.me` URL.
+
+## Embed in GitHub Pages or Google Sites
+GitHub Pages is static-only. You can host a frontend on Pages and embed the proxy URL (deployed on Render/Glitch) with an iframe:
+
+```html
+<iframe src="https://your-proxy.onrender.com" width="100%" height="800"></iframe>
+```
+
+If the proxy sets headers that prevent embedding, just add a big link that opens the proxy in a new tab.
+
+## Security & Ethics
+- Add auth (configured via `.env`).
+- Use rate-limiting and monitor logs.
+- Don’t use to bypass filters or commit crimes.
+
+---
+
+If you want, I can now:
+- Create this repo on GitHub for you (I can't do it directly but I can give you exact git commands). 
+- Give step-by-step Render deploy commands (copy-paste). 
+- Or produce a Cloudflare Workers proxy (serverless) — tell me which.
+
+*/
